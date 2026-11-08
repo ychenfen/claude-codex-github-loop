@@ -1,0 +1,200 @@
+name: ai-loop
+
+# Three trigger modes (see docs/WORKFLOW.md & CLAUDE.md):
+#  1) Push changes to .ai/task.md on main or ai-loop -> runs automatically
+#  2) workflow_dispatch with empty `task` -> reads .ai/task.md
+#  3) workflow_dispatch with inline `task` -> runs the one-off task prompt directly
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Task prompt (leave empty to read .ai/task.md)"
+        required: false
+        type: string
+      agent_backend:
+        description: "Local coding agent CLI to invoke (codex | claude | python)"
+        required: false
+        type: choice
+        options: [codex, claude, python]
+        default: codex
+  push:
+    branches: [main, ai-loop]
+    paths: ['.ai/task.md']
+
+# Serialize runs on the local workstation so concurrent jobs never clobber GPU/disk state
+concurrency:
+  group: local-workstation-loop
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  AGENT_BACKEND: ${{ inputs.agent_backend || vars.AGENT_BACKEND || 'codex' }}
+  CODEX_MODEL: ${{ vars.CODEX_MODEL || 'gpt-5-codex' }}
+  CLAUDE_MODEL: ${{ vars.CLAUDE_MODEL || 'claude-sonnet-4-5' }}
+  RUN_DIR: runs/${{ github.run_number }}
+  TARGET_BRANCH: ${{ github.ref_name }}
+
+# NOTE FOR WINDOWS SELF-HOSTED RUNNERS:
+# Bare `bash` on Windows resolves to C:\Windows\System32\bash.exe (the WSL launcher),
+# which fails if no WSL distro is installed. If your runner is on Windows, uncomment
+# the `defaults` block below to force Git Bash:
+# defaults:
+#   run:
+#     shell: 'C:\Program Files\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}'
+
+jobs:
+  run:
+    # Register your local runner with labels: [self-hosted, ai-worker] (or adjust below)
+    runs-on: [self-hosted, ai-worker]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Freeze Guardrails & Prepare Task Prompt
+        env:
+          TASK_INPUT: ${{ inputs.task }}   # Passed via env to prevent shell injection
+        run: |
+          echo "BASE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "STARTED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
+          # Freeze CI guardrail scripts in $RUNNER_TEMP BEFORE the agent runs.
+          # Even if the agent modifies scripts/ci/ in the workspace, the frozen copy runs!
+          cp -r scripts/ci "$RUNNER_TEMP/ci"
+          mkdir -p "$RUN_DIR"
+          if [ -n "$TASK_INPUT" ]; then
+            printf '%s\n' "$TASK_INPUT" > "$RUNNER_TEMP/task.md"
+            echo "TASK_SOURCE=workflow_dispatch_input" >> "$GITHUB_ENV"
+          else
+            cp .ai/task.md "$RUNNER_TEMP/task.md"
+            echo "TASK_SOURCE=.ai/task.md" >> "$GITHUB_ENV"
+          fi
+          cat >> "$RUNNER_TEMP/task.md" <<EOF
+
+          ---
+          Mandatory execution rules for every run:
+          - Local dataset paths are defined in config/local_paths.json (see config/local_paths.example.json). Raw dataset directories are strictly READ-ONLY; write code, audit logs, and derived summaries inside this repository. Never copy raw datasets into the repository.
+          - Do NOT modify .github/, .ai/, .claude/, scripts/ci/, or any **/PROTOCOL.md file; any changes to protected paths will be automatically reverted by guard.sh before push.
+          - Do NOT run git commit or git push yourself; the workflow commits verified changes after the guardrail check.
+          - Individual files must not exceed 5 MB; files > 5 MB are automatically unstaged by the guardrail.
+          - Use repository-relative paths in reports and summaries (e.g., experiments/EXP001/report.md) rather than host-specific absolute paths.
+          - Upon completion, write key quantitative metrics as JSON to $RUN_DIR/metrics.json (write {} if not applicable).
+          - Your final summary must include: a one-paragraph conclusion, key metrics, error excerpts (if any), and the list of modified files.
+          EOF
+          cp "$RUNNER_TEMP/task.md" "$RUN_DIR/task.md"
+
+      - name: Execute Local Coding Agent
+        id: agent
+        run: |
+          chcp.com 65001 > /dev/null 2>&1 || true   # Ensure UTF-8 codepage on Windows
+          set +e
+          case "$AGENT_BACKEND" in
+            codex)
+              # Note: --approve-for-me includes its own workspace-write sandbox; do not combine with --sandbox
+              codex exec \
+                --model "$CODEX_MODEL" \
+                --approve-for-me \
+                -o "$RUN_DIR/summary.md" \
+                "$(cat "$RUNNER_TEMP/task.md")" \
+                2> "$RUN_DIR/agent.stderr.log" < /dev/null
+              CODE=$?
+              ;;
+            claude)
+              claude -p "$(cat "$RUNNER_TEMP/task.md")" \
+                --model "$CLAUDE_MODEL" \
+                --allowedTools "Bash,Read,Write,Edit,Glob,Grep" \
+                > "$RUN_DIR/summary.md" \
+                2> "$RUN_DIR/agent.stderr.log" < /dev/null
+              CODE=$?
+              ;;
+            python)
+              python3 scripts/tools/smoke_test.py --out "$RUN_DIR/metrics.json" \
+                > "$RUN_DIR/summary.md" \
+                2> "$RUN_DIR/agent.stderr.log"
+              CODE=$?
+              ;;
+            *)
+              echo "Unknown AGENT_BACKEND: $AGENT_BACKEND" > "$RUN_DIR/agent.stderr.log"
+              CODE=2
+              ;;
+          esac
+          set -e
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          [ -f "$RUN_DIR/metrics.json" ] || echo '{}' > "$RUN_DIR/metrics.json"
+          tail -n 300 "$RUN_DIR/agent.stderr.log" > "$RUN_DIR/agent_tail.log"
+          rm -f "$RUN_DIR/agent.stderr.log"
+          [ -f "$RUN_DIR/summary.md" ] || echo "(Agent produced no summary.md, exit code $CODE; see agent_tail.log)" > "$RUN_DIR/summary.md"
+
+          if [ "$CODE" -ne 0 ]; then
+            echo "::group::agent_tail.log (exit $CODE)"
+            tail -n 80 "$RUN_DIR/agent_tail.log"
+            echo "::endgroup::"
+          fi
+
+      - name: Record Metadata & Redact Secrets
+        if: always()
+        run: |
+          mkdir -p "$RUN_DIR"
+          cat > "$RUN_DIR/meta.json" <<EOF
+          {
+            "workflow": "ai-loop",
+            "run_number": ${{ github.run_number }},
+            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "event": "${{ github.event_name }}",
+            "base_sha": "$BASE_SHA",
+            "task_source": "$TASK_SOURCE",
+            "agent_backend": "$AGENT_BACKEND",
+            "model": "$CODEX_MODEL",
+            "runner": "${{ runner.name }}",
+            "started_at": "$STARTED_AT",
+            "finished_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+            "exit_code": "${{ steps.agent.outputs.code }}"
+          }
+          EOF
+          for f in "$RUN_DIR"/*; do
+            [ -f "$f" ] || continue
+            sed -E -i.bak \
+              -e 's/\b(sk|ghp|gho|github_pat|xox[bap]|AKIA)[-_A-Za-z0-9]{8,}/[REDACTED]/g' \
+              -e "s#$HOME#~#g" "$f" && rm -f "$f.bak"
+          done
+
+      - name: Enforce Hard Security Guardrails
+        if: always()
+        run: bash "$RUNNER_TEMP/ci/guard.sh" "$BASE_SHA" "$RUN_DIR"
+
+      - name: Upload Run Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-${{ github.run_number }}
+          path: runs/${{ github.run_number }}
+          retention-days: 14
+
+      - name: Write Job Summary
+        if: always()
+        run: |
+          {
+            echo "## AI Loop Run #${{ github.run_number }} (backend: $AGENT_BACKEND, exit ${{ steps.agent.outputs.code }})"
+            echo
+            cat "$RUN_DIR/summary.md"
+            echo
+            cat "$RUN_DIR/guard.md"
+            echo
+            echo '### Staged Changes'
+            echo '```'
+            git diff --cached --stat
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit & Push Verified Outputs
+        if: always()
+        run: |
+          bash "$RUNNER_TEMP/ci/push.sh" "ai-loop: run #${{ github.run_number }} (exit ${{ steps.agent.outputs.code }})"
+
+      - name: Exit with Agent Status
+        run: exit ${{ steps.agent.outputs.code }}

@@ -1,0 +1,6 @@
+# Queued Next Task (Offline Runner Staging)
+
+> Why `.ai/next_task.md`?
+> GitHub Actions automatically cancels queued workflow runs if a self-hosted runner stays offline for > 24 hours.
+> When the local workstation is asleep or offline, Claude on the Web writes the next experiment specification to `.ai/next_task.md` (which does NOT trigger `ai-loop.yml`).
+> Once the workstation is online, rename or copy `.ai/next_task.md` -> `.ai/task.md` and push to trigger immediate execution.

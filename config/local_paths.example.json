@@ -1,0 +1,20 @@
+{
+  "description": "Local workstation dataset and scratch directories. Copy to config/local_paths.json and customize for your machine.",
+  "roots": {
+    "medical_imaging_corpus": {
+      "path": "/Volumes/NVMeData/datasets/chest-xray-500gb",
+      "mode": "ro",
+      "description": "Read-only 500GB DICOM/PNG medical imaging benchmark corpus"
+    },
+    "llm_eval_benchmarks": {
+      "path": "~/datasets/llm-eval-harnesses",
+      "mode": "ro",
+      "description": "Read-only local LLM evaluation datasets (JSONL / Parquet)"
+    },
+    "local_checkpoints": {
+      "path": "~/models/checkpoints",
+      "mode": "rw",
+      "description": "Local model weights & large intermediate artifacts (never committed to git)"
+    }
+  }
+}

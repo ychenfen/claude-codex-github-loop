@@ -1,0 +1,196 @@
+name: remote-cmd
+
+# Execute deterministic commands on the local self-hosted runner without invoking an LLM agent:
+# run pytest, inspect local directories via survey.py, check GPU status via smoke_test.py,
+# or collect specific files into a private 14-day GitHub Artifact for the Cloud Brain to read.
+on:
+  workflow_dispatch:
+    inputs:
+      command:
+        description: "Command to execute (e.g., python3 -m pytest tests -q); pass `true` if only collecting files"
+        required: true
+        type: string
+      workdir:
+        description: "Working directory (leave empty for repo root; supports local absolute paths)"
+        required: false
+        type: string
+        default: ""
+      shell:
+        description: "Shell to execute the command in"
+        required: false
+        type: choice
+        options: [bash, powershell, cmd]
+        default: bash
+      collect:
+        description: "Semicolon-separated file/dir/glob paths to collect into artifact (never committed to git)"
+        required: false
+        type: string
+        default: ""
+      commit:
+        description: "Commit workspace changes (after passing guard.sh) back to the branch"
+        required: false
+        type: boolean
+        default: false
+      timeout_minutes:
+        description: "Command timeout in minutes"
+        required: false
+        type: number
+        default: 60
+
+concurrency:
+  group: local-workstation-loop
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8
+  RUN_DIR: runs/cmd-${{ github.run_number }}
+  TARGET_BRANCH: ${{ github.ref_name }}
+
+# NOTE FOR WINDOWS SELF-HOSTED RUNNERS:
+# Uncomment the `defaults` block below if your runner runs on Windows:
+# defaults:
+#   run:
+#     shell: 'C:\Program Files\Git\bin\bash.exe --noprofile --norc -e -o pipefail {0}'
+
+jobs:
+  run:
+    runs-on: [self-hosted, ai-worker]
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Freeze Guardrails & Initialize Run Directory
+        run: |
+          echo "BASE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "STARTED_AT=$(date -u '+%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
+          cp -r scripts/ci "$RUNNER_TEMP/ci"
+          mkdir -p "$RUN_DIR"
+
+      - name: Execute Command
+        id: cmd
+        timeout-minutes: ${{ inputs.timeout_minutes || 60 }}
+        env:
+          CMD: ${{ inputs.command }}   # Passed via env to avoid shell injection
+          WORKDIR: ${{ inputs.workdir }}
+          SHELL_KIND: ${{ inputs.shell || 'bash' }}
+        run: |
+          chcp.com 65001 > /dev/null 2>&1 || true
+          REPO="$PWD"
+          mkdir -p "$RUNNER_TEMP/out"
+          { printf 'shell: %s\nworkdir: %s\n\n' "$SHELL_KIND" "${WORKDIR:-<repo-root>}"; printf '%s\n' "$CMD"; } > "$RUN_DIR/command.txt"
+          if [ -n "$WORKDIR" ]; then
+            TARGET_DIR="$WORKDIR"
+            if command -v cygpath > /dev/null 2>&1; then
+              TARGET_DIR="$(cygpath -u "$WORKDIR")"
+            fi
+            if ! cd "$TARGET_DIR"; then
+              echo "Working directory does not exist or is inaccessible: $WORKDIR" | tee "$RUN_DIR/output.txt" > "$RUNNER_TEMP/out/output.full.txt"
+              echo "::error::Working directory does not exist: $WORKDIR"
+              echo "code=2" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          OUT="$RUNNER_TEMP/out/output.full.txt"
+          set +e
+          case "$SHELL_KIND" in
+            powershell) powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $CMD" > "$OUT" 2>&1 ;;
+            cmd)        cmd.exe //d //c "chcp 65001 >nul & $CMD" > "$OUT" 2>&1 ;;
+            *)          bash -o pipefail -c "$CMD" > "$OUT" 2>&1 ;;
+          esac
+          CODE=$?
+          set -e
+          cd "$REPO"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          # Keep only the last 2000 lines in git; full output goes into the artifact
+          tail -n 2000 "$OUT" > "$RUN_DIR/output.txt"
+          echo "::group::Last 200 lines of output (exit $CODE)"
+          tail -n 200 "$OUT"
+          echo "::endgroup::"
+
+      - name: Collect Requested Files into Artifact Staging
+        if: always() && inputs.collect != ''
+        env:
+          COLLECT: ${{ inputs.collect }}
+        run: |
+          mkdir -p "$RUN_DIR"
+          bash "$RUNNER_TEMP/ci/collect.sh" "$COLLECT" "$RUNNER_TEMP/out/collect" "$RUN_DIR/collect_manifest.txt"
+
+      - name: Record Metadata & Redact Secrets
+        if: always()
+        run: |
+          mkdir -p "$RUN_DIR"
+          cat > "$RUN_DIR/meta.json" <<EOF
+          {
+            "workflow": "remote-cmd",
+            "run_number": ${{ github.run_number }},
+            "run_url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+            "base_sha": "$BASE_SHA",
+            "runner": "${{ runner.name }}",
+            "started_at": "$STARTED_AT",
+            "finished_at": "$(date -u '+%Y-%m-%dT%H:%M:%SZ')",
+            "exit_code": "${{ steps.cmd.outputs.code }}",
+            "shell": "${{ inputs.shell }}",
+            "collect_artifact": "cmd-${{ github.run_number }}"
+          }
+          EOF
+          for f in "$RUN_DIR"/*; do
+            [ -f "$f" ] || continue
+            sed -E -i.bak \
+              -e 's/\b(sk|ghp|gho|github_pat|xox[bap]|AKIA)[-_A-Za-z0-9]{8,}/[REDACTED]/g' \
+              -e "s#$HOME#~#g" "$f" && rm -f "$f.bak"
+          done
+
+      - name: Enforce Hard Security Guardrails
+        if: always()
+        run: |
+          if [ "${{ inputs.commit }}" != "true" ]; then
+            # Discard workspace mutations unless commit=true was explicitly requested
+            git reset -q --hard "$BASE_SHA"
+            git clean -fdq -e "$RUN_DIR"
+          fi
+          bash "$RUNNER_TEMP/ci/guard.sh" "$BASE_SHA" "$RUN_DIR"
+
+      - name: Upload Full Output & Collected Files
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cmd-${{ github.run_number }}
+          path: ${{ runner.temp }}/out
+          retention-days: 14
+
+      - name: Write Job Summary
+        if: always()
+        run: |
+          {
+            echo "## Remote Command #${{ github.run_number }} (exit ${{ steps.cmd.outputs.code }})"
+            echo
+            echo '```'; cat "$RUN_DIR/command.txt"; echo '```'
+            echo
+            echo '### Last 40 Lines of Output'
+            echo '```'; tail -n 40 "$RUN_DIR/output.txt"; echo '```'
+            echo
+            if [ -f "$RUN_DIR/collect_manifest.txt" ]; then
+              echo "### Collected Files: $(grep -c '^OK' "$RUN_DIR/collect_manifest.txt" || true) collected (artifact cmd-${{ github.run_number }})"
+              echo '```'; head -n 40 "$RUN_DIR/collect_manifest.txt"; echo '```'
+              echo
+            fi
+            cat "$RUN_DIR/guard.md"
+            echo
+            echo '### Staged Changes'
+            echo '```'; git diff --cached --stat; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Commit & Push Run Log
+        if: always()
+        run: |
+          bash "$RUNNER_TEMP/ci/push.sh" "remote-cmd: run #${{ github.run_number }} (exit ${{ steps.cmd.outputs.code }})"
+
+      - name: Exit with Command Status
+        run: exit ${{ steps.cmd.outputs.code }}
